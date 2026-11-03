@@ -7,12 +7,18 @@ a read-write agent (all tools) with the same per-user Portainer key.
 
 For `/containers/{id}/logs` it sets stdout, stderr and tail when the caller
 gives none, never follows the stream, and removes Docker's 8-byte frame
-headers from multiplexed output. For `/containers/{id}/stats` it requests a
-single sample.
+headers from multiplexed output. `grep` keeps only the log lines that match a
+regular expression; without tail or since it then searches the last
+GREP_TAIL lines. Logs longer than the response cap of the server keep their
+newest lines: the cap of portainer-mcp would cut off the end, and its hint
+(JMESPath `select`) does not apply to text. For `/containers/{id}/stats` it
+requests a single sample.
 """
 
 from __future__ import annotations
 
+import os
+import re
 import struct
 from typing import Annotated
 
@@ -21,9 +27,12 @@ from mcp.types import ToolAnnotations
 from pydantic import BeforeValidator, Field
 
 from portainer_mcp import proxy, server
-from portainer_mcp.shaping import SELECT_DESCRIPTION
+from portainer_mcp.shaping import DEFAULT_MAX_RESPONSE_CHARS, SELECT_DESCRIPTION
 
 DEFAULT_TAIL = "200"
+GREP_TAIL = "100000"
+# Room below the cap of the server for the note in front of the lines.
+NOTE_ROOM = 600
 _MULTIPLEXED = "application/vnd.docker.multiplexed-stream"
 
 
@@ -45,14 +54,49 @@ def _demultiplex(data: bytes) -> str:
     return out.decode("utf-8", "replace")
 
 
-def _query(path: str, query_params: dict[str, str] | None) -> dict[str, str]:
+def _max_chars() -> int:
+    return int(os.environ.get("PORTAINER_MAX_RESPONSE_CHARS") or DEFAULT_MAX_RESPONSE_CHARS)
+
+
+def _shape_logs(text: str, pattern: re.Pattern[str] | None) -> str:
+    """Filter log lines by `pattern` and keep the newest lines that fit the cap."""
+    lines = [line.rstrip("\r") for line in text.split("\n")]
+    if lines and lines[-1] == "":
+        lines.pop()
+    notes = []
+    if pattern is not None:
+        total = len(lines)
+        lines = [line for line in lines if pattern.search(line)]
+        notes.append(f"grep {pattern.pattern!r}: {len(lines)} of {total} lines match")
+    if not lines:
+        if pattern is None:
+            notes.append("no log lines in the requested range")
+        return "[" + "; ".join(notes) + "]"
+    budget = max(_max_chars() - NOTE_ROOM, 1000)
+    kept, size = [], 0
+    for line in reversed(lines):
+        size += len(line) + 1
+        if size > budget and kept:
+            break
+        kept.append(line[-budget:])
+    kept.reverse()
+    if len(kept) < len(lines):
+        notes.append(
+            f"{len(lines) - len(kept)} older lines omitted, the newest {len(kept)} follow; "
+            "narrow with grep (e.g. ERROR|WARN|Exception), since/until or a smaller tail"
+        )
+    head = "[" + "; ".join(notes) + "]\n" if notes else ""
+    return head + "\n".join(kept)
+
+
+def _query(path: str, query_params: dict[str, str] | None, grep: bool = False) -> dict[str, str]:
     params = dict(query_params or {})
     if path.endswith("/logs"):
         params["follow"] = "false"
         if "stdout" not in params and "stderr" not in params:
             params["stdout"] = params["stderr"] = "true"
         if "tail" not in params and "since" not in params:
-            params["tail"] = DEFAULT_TAIL
+            params["tail"] = GREP_TAIL if grep else DEFAULT_TAIL
     if path.endswith("/stats"):
         params["stream"] = "false"
     return params
@@ -72,10 +116,16 @@ def register(mcp, client, *, read_only: bool) -> None:
             "The `path` is forwarded to the Docker daemon, e.g. /containers/json, "
             "/containers/{id}/json, /containers/{id}/logs, /containers/{id}/stats, "
             "/images/json, /networks, /volumes. Logs: stdout and stderr and the last "
-            f"{DEFAULT_TAIL} lines unless `query_params` set them (tail, since, timestamps); "
-            "the stream is never followed. Stats: a single sample. Pass a JMESPath "
+            f"{DEFAULT_TAIL} lines unless `query_params` set them (tail, since, until as Unix "
+            "timestamps, timestamps); the stream is never followed. To find problems in a log, "
+            "pass `grep` (e.g. ERROR|WARN|Exception|Caused by) instead of paging through it: "
+            f"it searches the last {GREP_TAIL} lines unless tail or since is set and returns "
+            "only the matching lines with their count. A log longer than the response limit "
+            "keeps its newest lines. Stats: a single sample. Pass a JMESPath "
             "`select` to project JSON responses, e.g. for /containers/json with "
-            "query_params {\"all\": \"true\"}: `[].{name:Names[0],state:State,status:Status,image:Image}`."
+            "query_params {\"all\": \"true\", \"filters\": \"{\\\"name\\\": [\\\"web\\\"]}\"} "
+            "(every filter value is a list; name matches a part of the name): "
+            "`[].{name:Names[0],state:State,status:Status,image:Image}`."
         ),
     )
     async def docker_get(
@@ -89,19 +139,39 @@ def register(mcp, client, *, read_only: bool) -> None:
             Field(description="Query parameters"),
         ] = None,
         select: Annotated[str | None, Field(description=SELECT_DESCRIPTION)] = None,
+        grep: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Logs only: regular expression, case-insensitive; returns only the "
+                    "matching log lines, e.g. ERROR|WARN|Exception|Caused by"
+                )
+            ),
+        ] = None,
     ) -> str:
         proxy._validate_path(path)
+        logs = path.endswith("/logs")
+        pattern = None
+        if grep:
+            if not logs:
+                raise ToolError("grep applies only to /containers/{id}/logs; use select for JSON")
+            try:
+                pattern = re.compile(grep, re.IGNORECASE)
+            except re.error as exc:
+                raise ToolError(f"invalid grep expression {grep!r}: {exc}") from exc
         response = await client.request(
             "GET",
             f"/endpoints/{environment_id}/docker{path}",
-            params=_query(path, query_params),
+            params=_query(path, query_params, grep=pattern is not None),
         )
         if response.is_error:
             raise ToolError(
                 f"docker API request failed (HTTP {response.status_code}) for "
                 f"GET {path}: {response.text[:2000]}"
             )
-        if path.endswith("/logs") or response.headers.get("content-type", "").startswith(_MULTIPLEXED):
+        if logs:
+            return _shape_logs(_demultiplex(response.content), pattern)
+        if response.headers.get("content-type", "").startswith(_MULTIPLEXED):
             return _demultiplex(response.content)
         return proxy._apply_select(response.text, select)
 
