@@ -9,9 +9,10 @@ For `/containers/{id}/logs` it sets stdout, stderr and tail when the caller
 gives none, never follows the stream, and removes Docker's 8-byte frame
 headers from multiplexed output. `grep` keeps only the log lines that match a
 regular expression; without tail or since it then searches the last
-GREP_TAIL lines. Logs longer than the response cap of the server keep their
-newest lines: the cap of portainer-mcp would cut off the end, and its hint
-(JMESPath `select`) does not apply to text. For `/containers/{id}/stats` it
+GREP_TAIL lines. Logs longer than LOG_CHARS keep their newest lines: the cap
+of portainer-mcp would cut off the end, and its hint (JMESPath `select`) does
+not apply to text. LOG_CHARS is below that cap because a few raw logs of
+long-line applications fill the context of the model. For `/containers/{id}/stats` it
 requests a single sample.
 """
 
@@ -31,6 +32,7 @@ from portainer_mcp.shaping import DEFAULT_MAX_RESPONSE_CHARS, SELECT_DESCRIPTION
 
 DEFAULT_TAIL = "200"
 GREP_TAIL = "100000"
+LOG_CHARS = 20_000
 # Room below the cap of the server for the note in front of the lines.
 NOTE_ROOM = 600
 _MULTIPLEXED = "application/vnd.docker.multiplexed-stream"
@@ -72,7 +74,7 @@ def _shape_logs(text: str, pattern: re.Pattern[str] | None) -> str:
         if pattern is None:
             notes.append("no log lines in the requested range")
         return "[" + "; ".join(notes) + "]"
-    budget = max(_max_chars() - NOTE_ROOM, 1000)
+    budget = max(min(LOG_CHARS, _max_chars() - NOTE_ROOM), 1000)
     kept, size = [], 0
     for line in reversed(lines):
         size += len(line) + 1
@@ -120,8 +122,8 @@ def register(mcp, client, *, read_only: bool) -> None:
             "timestamps, timestamps); the stream is never followed. To find problems in a log, "
             "pass `grep` (e.g. ERROR|WARN|Exception|Caused by) instead of paging through it: "
             f"it searches the last {GREP_TAIL} lines unless tail or since is set and returns "
-            "only the matching lines with their count. A log longer than the response limit "
-            "keeps its newest lines. Stats: a single sample. Pass a JMESPath "
+            "only the matching lines with their count. A log returns at most "
+            f"{LOG_CHARS} characters, its newest lines. Stats: a single sample. Pass a JMESPath "
             "`select` to project JSON responses, e.g. for /containers/json with "
             "query_params {\"all\": \"true\", \"filters\": \"{\\\"name\\\": [\\\"web\\\"]}\"} "
             "(every filter value is a list; name matches a part of the name): "

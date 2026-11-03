@@ -11,9 +11,10 @@ read-write agent (all tools), and each user enters their Portainer API key only 
   them; the stream is never followed; Docker's frame headers are removed from multiplexed output.
   - `grep` (regular expression, case-insensitive) returns only the matching lines and their count;
     without `tail` or `since` it searches the last 100000 lines.
-  - A log longer than the response cap (`PORTAINER_MAX_RESPONSE_CHARS`, default 50000) keeps its
-    newest lines with a note in front. The cap of the server would keep the oldest lines and
-    suggest a JMESPath `select`, which does not apply to text.
+  - A log returns at most 20000 characters, its newest lines with a note in front. The cap of the
+    server (`PORTAINER_MAX_RESPONSE_CHARS`, default 50000) would keep the oldest lines and suggest
+    a JMESPath `select`, which does not apply to text; three raw logs of an application with long
+    lines at that size took a subagent past 100000 tokens of context.
 - **Stats** (`/containers/{id}/stats`): a single sample.
 
 The image is derived from the upstream image (pinned by digest, see `Dockerfile`). `bos_get.py` wraps
