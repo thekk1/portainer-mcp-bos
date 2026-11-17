@@ -14,13 +14,23 @@ of portainer-mcp would cut off the end, and its hint (JMESPath `select`) does
 not apply to text. LOG_CHARS is below that cap because a few raw logs of
 long-line applications fill the context of the model. For `/containers/{id}/stats` it
 requests a single sample.
+
+For `/events` it sets `until` to now when the caller gives none, so the stream
+ends. Docker sends one JSON object per line; `docker_get` returns them as a
+list, so that `select` applies. Docker keeps only the last EVENTS_KEPT events of
+a host in memory, on a busy host less than an hour. A second request reads that
+buffer, and a note in front of the result names its oldest event; if the
+requested period starts earlier, the note says that older events are lost.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import struct
+import time
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastmcp.exceptions import ToolError
@@ -36,6 +46,9 @@ LOG_CHARS = 20_000
 # Room below the cap of the server for the note in front of the lines.
 NOTE_ROOM = 600
 _MULTIPLEXED = "application/vnd.docker.multiplexed-stream"
+# Size of the event buffer of the Docker daemon (eventsLimit in daemon/events).
+EVENTS_KEPT = 256
+_DURATION = re.compile(r"(\d+(?:\.\d+)?)(h|m|s)")
 
 
 def _demultiplex(data: bytes) -> str:
@@ -91,6 +104,64 @@ def _shape_logs(text: str, pattern: re.Pattern[str] | None) -> str:
     return head + "\n".join(kept)
 
 
+def _parse_events(text: str) -> list | None:
+    """Parse Docker's newline-delimited JSON events; None if a line is no JSON."""
+    events = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            return None
+    return events
+
+
+def _timestamp(value: str | None, now: float) -> float | None:
+    """Docker's since/until: Unix seconds, RFC 3339 or a duration back from now."""
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        pass
+    parts = _DURATION.findall(value)
+    if parts and "".join(n + u for n, u in parts) == value:
+        factor = {"h": 3600, "m": 60, "s": 1}
+        return now - sum(float(n) * factor[u] for n, u in parts)
+    return None
+
+
+def _events_note(kept: list, since: float | None, now: float) -> str:
+    """Name the oldest event Docker still keeps and whether the period starts before it."""
+    if not kept:
+        return "[Docker keeps no events of this host.]"
+    oldest = min(e.get("time", now) for e in kept)
+    stamp = datetime.fromtimestamp(oldest, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    minutes = max(int((now - oldest) // 60), 0)
+    if len(kept) < EVENTS_KEPT:
+        return (
+            f"[Docker keeps {len(kept)} events of this host, all since its start; the oldest is "
+            f"from {stamp} ({minutes} minutes ago).]"
+        )
+    note = (
+        f"[Docker keeps only the last {EVENTS_KEPT} events of this host; the oldest is from "
+        f"{stamp} ({minutes} minutes ago)."
+    )
+    if since is None or since < oldest:
+        note += (
+            " The requested period starts earlier: events before that time are lost, so a "
+            "missing event does not mean that nothing happened. For a longer history read "
+            "State and RestartCount from /containers/{id}/json and the log."
+        )
+    return note + "]"
+
+
 def _query(path: str, query_params: dict[str, str] | None, grep: bool = False) -> dict[str, str]:
     params = dict(query_params or {})
     if path.endswith("/logs"):
@@ -101,6 +172,8 @@ def _query(path: str, query_params: dict[str, str] | None, grep: bool = False) -
             params["tail"] = GREP_TAIL if grep else DEFAULT_TAIL
     if path.endswith("/stats"):
         params["stream"] = "false"
+    if path == "/events" and "until" not in params:
+        params["until"] = str(int(time.time()))
     return params
 
 
@@ -123,7 +196,9 @@ def register(mcp, client, *, read_only: bool) -> None:
             "pass `grep` (e.g. ERROR|WARN|Exception|Caused by) instead of paging through it: "
             f"it searches the last {GREP_TAIL} lines unless tail or since is set and returns "
             "only the matching lines with their count. A log returns at most "
-            f"{LOG_CHARS} characters, its newest lines. Stats: a single sample. Pass a JMESPath "
+            f"{LOG_CHARS} characters, its newest lines. Stats: a single sample. Events: until "
+            f"defaults to now; Docker keeps only the last {EVENTS_KEPT} events of a host, the "
+            "result starts with the time of the oldest one. Pass a JMESPath "
             "`select` to project JSON responses, e.g. for /containers/json with "
             "query_params {\"all\": \"true\", \"filters\": \"{\\\"name\\\": [\\\"web\\\"]}\"} "
             "(every filter value is a list; name matches a part of the name): "
@@ -173,9 +248,28 @@ def register(mcp, client, *, read_only: bool) -> None:
             )
         if logs:
             return _shape_logs(_demultiplex(response.content), pattern)
+        if path == "/events":
+            return await _events(client, environment_id, response.text, query_params, select)
         if response.headers.get("content-type", "").startswith(_MULTIPLEXED):
             return _demultiplex(response.content)
         return proxy._apply_select(response.text, select)
+
+
+async def _events(client, environment_id: int, text: str, query_params, select) -> str:
+    events = _parse_events(text)
+    if events is None:
+        return proxy._apply_select(text, select)
+    now = time.time()
+    params = _query("/events", query_params)
+    kept_response = await client.request(
+        "GET", f"/endpoints/{environment_id}/docker/events", params={"until": params["until"]}
+    )
+    kept = None if kept_response.is_error else _parse_events(kept_response.text)
+    if kept is None:
+        note = f"[Docker keeps only the last {EVENTS_KEPT} events of this host; their age is unknown.]"
+    else:
+        note = _events_note(kept, _timestamp(params.get("since"), now), now)
+    return note + "\n" + proxy._apply_select(json.dumps(events), select)
 
 
 proxy.register = register
