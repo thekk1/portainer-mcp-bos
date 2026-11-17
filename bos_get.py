@@ -9,7 +9,14 @@ For `/containers/{id}/logs` it sets stdout, stderr and tail when the caller
 gives none, never follows the stream, and removes Docker's 8-byte frame
 headers from multiplexed output. `grep` keeps only the log lines that match a
 regular expression; without tail or since it then searches the last
-GREP_TAIL lines. Logs longer than LOG_CHARS keep their newest lines: the cap
+GREP_TAIL lines. tail, since and until may also be passed as arguments of
+their own; since and until take Unix seconds, RFC 3339 or a duration back from
+now, and Docker gets Unix seconds. An empty log range names its period as UTC
+dates, so that a wrongly computed timestamp shows. Values of command-line
+options and assignments whose name contains passw, secret, token, credential
+or api/private/encryption key, `unencrypted:` values, Bearer and Basic tokens
+and passwords in URLs are replaced with [REDACTED], as portainer-mcp does for
+env values; PORTAINER_EXPOSE_ENV_VALUES=1 disables both. Logs longer than LOG_CHARS keep their newest lines: the cap
 of portainer-mcp would cut off the end, and its hint (JMESPath `select`) does
 not apply to text. LOG_CHARS is below that cap because a few raw logs of
 long-line applications fill the context of the model. For `/containers/{id}/stats` it
@@ -37,7 +44,7 @@ from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BeforeValidator, Field
 
-from portainer_mcp import proxy, server
+from portainer_mcp import proxy, redaction, server
 from portainer_mcp.shaping import DEFAULT_MAX_RESPONSE_CHARS, SELECT_DESCRIPTION
 
 DEFAULT_TAIL = "200"
@@ -49,6 +56,13 @@ _MULTIPLEXED = "application/vnd.docker.multiplexed-stream"
 # Size of the event buffer of the Docker daemon (eventsLimit in daemon/events).
 EVENTS_KEPT = 256
 _DURATION = re.compile(r"(\d+(?:\.\d+)?)(h|m|s)")
+_SECRET_NAME = r"[\w.-]*(?:passw|pwd|secret|token|credential|api_?key|private_?key|encryption_?key)[\w.-]*"
+_SECRETS = [
+    (re.compile(r"(?i)\b(" + _SECRET_NAME + r")(\"?\s*[=:]\s*)(?!\[REDACTED\])(\"[^\"]*\"|'[^']*'|[^\s,;&\"']+)"), r"\1\2[REDACTED]"),
+    (re.compile(r"(?i)\bunencrypted:(?!\[REDACTED\])\S+"), "unencrypted:[REDACTED]"),
+    (re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [REDACTED]"),
+    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^/\s:@]+:)[^/\s@]+@"), r"\1[REDACTED]@"),
+]
 
 
 def _demultiplex(data: bytes) -> str:
@@ -73,20 +87,44 @@ def _max_chars() -> int:
     return int(os.environ.get("PORTAINER_MAX_RESPONSE_CHARS") or DEFAULT_MAX_RESPONSE_CHARS)
 
 
-def _shape_logs(text: str, pattern: re.Pattern[str] | None) -> str:
-    """Filter log lines by `pattern` and keep the newest lines that fit the cap."""
+def _redact(line: str) -> str:
+    """Replace secrets in a log line with redaction.SENTINEL."""
+    for pattern, replacement in _SECRETS:
+        line = pattern.sub(replacement, line)
+    return line
+
+
+def _iso(value: float) -> str:
+    return datetime.fromtimestamp(value, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _period(params: dict[str, str]) -> str | None:
+    """The since/until of a log request as UTC dates, None without both."""
+    if "since" not in params and "until" not in params:
+        return None
+    since = _iso(float(params["since"])) if "since" in params else "start"
+    until = _iso(float(params["until"])) if "until" in params else "now"
+    return f"period {since} to {until}"
+
+
+def _shape_logs(text: str, pattern: re.Pattern[str] | None, period: str | None = None) -> str:
+    """Filter log lines by `pattern`, redact secrets and keep the newest lines that fit the cap."""
     lines = [line.rstrip("\r") for line in text.split("\n")]
     if lines and lines[-1] == "":
         lines.pop()
     notes = []
+    total = len(lines)
     if pattern is not None:
-        total = len(lines)
         lines = [line for line in lines if pattern.search(line)]
         notes.append(f"grep {pattern.pattern!r}: {len(lines)} of {total} lines match")
     if not lines:
         if pattern is None:
             notes.append("no log lines in the requested range")
+        if total == 0 and period:
+            notes.append(period)
         return "[" + "; ".join(notes) + "]"
+    if not redaction.is_expose_enabled():
+        lines = [_redact(line) for line in lines]
     budget = max(min(LOG_CHARS, _max_chars() - NOTE_ROOM), 1000)
     kept, size = [], 0
     for line in reversed(lines):
@@ -127,9 +165,13 @@ def _timestamp(value: str | None, now: float) -> float | None:
     except ValueError:
         pass
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         pass
+    else:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
     parts = _DURATION.findall(value)
     if parts and "".join(n + u for n, u in parts) == value:
         factor = {"h": 3600, "m": 60, "s": 1}
@@ -164,8 +206,21 @@ def _events_note(kept: list, since: float | None, now: float) -> str:
 
 def _query(path: str, query_params: dict[str, str] | None, grep: bool = False) -> dict[str, str]:
     params = dict(query_params or {})
+    if path.endswith("/logs") or path == "/events":
+        now = time.time()
+        for key in ("since", "until"):
+            if key in params:
+                value = _timestamp(params[key], now)
+                if value is None:
+                    raise ToolError(
+                        f"{key} {params[key]!r}: give Unix seconds, RFC 3339 "
+                        "(e.g. 2026-01-31T14:30:00Z) or a duration back from now (e.g. 2h)"
+                    )
+                params[key] = f"{value:.0f}"
     if path.endswith("/logs"):
         params["follow"] = "false"
+        if "tail" in params:
+            params["tail"] = params["tail"].strip("\"' ")
         if "stdout" not in params and "stderr" not in params:
             params["stdout"] = params["stderr"] = "true"
         if "tail" not in params and "since" not in params:
@@ -194,8 +249,11 @@ def register(mcp, client, *, read_only: bool) -> None:
             "The `path` is forwarded to the Docker daemon, e.g. /containers/json, "
             "/containers/{id}/json, /containers/{id}/logs, /containers/{id}/stats, "
             "/images/json, /networks, /volumes. Logs: stdout and stderr and the last "
-            f"{DEFAULT_TAIL} lines unless `query_params` set them (tail, since, until as Unix "
-            "timestamps, timestamps); the stream is never followed. To find problems in a log, "
+            f"{DEFAULT_TAIL} lines unless set (tail, since, until, as arguments or in "
+            "`query_params`; since and until as RFC 3339 like 2026-01-31T14:30:00Z, Unix "
+            "seconds or a duration like 2h); the stream is never followed. An empty range "
+            "names its period. Secrets in log lines come back as [REDACTED]. To find problems "
+            "in a log, "
             "pass `grep` (e.g. ERROR|WARN|Exception|Caused by) instead of paging through it: "
             f"it searches the last {GREP_TAIL} lines unless tail or since is set and returns "
             "only the matching lines with their count. A log returns at most "
@@ -228,9 +286,23 @@ def register(mcp, client, *, read_only: bool) -> None:
                 )
             ),
         ] = None,
+        tail: Annotated[
+            str | int | None, Field(description="Logs: number of lines from the end")
+        ] = None,
+        since: Annotated[
+            str | int | None,
+            Field(description="Logs and events: start, RFC 3339 (UTC with Z), Unix seconds or a duration like 2h"),
+        ] = None,
+        until: Annotated[
+            str | int | None,
+            Field(description="Logs and events: end, RFC 3339 (UTC with Z), Unix seconds or a duration like 30m"),
+        ] = None,
     ) -> str:
         proxy._validate_path(path)
         logs = path.endswith("/logs")
+        extra = {k: str(v).strip("\"' ") for k, v in (("tail", tail), ("since", since), ("until", until)) if v is not None}
+        if extra:
+            query_params = {**extra, **(query_params or {})}
         pattern = None
         if grep:
             if not logs:
@@ -239,10 +311,9 @@ def register(mcp, client, *, read_only: bool) -> None:
                 pattern = re.compile(grep, re.IGNORECASE)
             except re.error as exc:
                 raise ToolError(f"invalid grep expression {grep!r}: {exc}") from exc
+        params = _query(path, query_params, grep=pattern is not None)
         response = await client.request(
-            "GET",
-            f"/endpoints/{environment_id}/docker{path}",
-            params=_query(path, query_params, grep=pattern is not None),
+            "GET", f"/endpoints/{environment_id}/docker{path}", params=params
         )
         if response.is_error:
             raise ToolError(
@@ -250,7 +321,7 @@ def register(mcp, client, *, read_only: bool) -> None:
                 f"GET {path}: {response.text[:2000]}"
             )
         if logs:
-            return _shape_logs(_demultiplex(response.content), pattern)
+            return _shape_logs(_demultiplex(response.content), pattern, _period(params))
         if path == "/events":
             return await _events(client, environment_id, response.text, query_params, select)
         if response.headers.get("content-type", "").startswith(_MULTIPLEXED):
