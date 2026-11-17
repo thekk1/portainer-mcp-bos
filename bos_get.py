@@ -15,8 +15,8 @@ not apply to text. LOG_CHARS is below that cap because a few raw logs of
 long-line applications fill the context of the model. For `/containers/{id}/stats` it
 requests a single sample.
 
-For `/events` it sets `until` to now when the caller gives none, so the stream
-ends. Docker sends one JSON object per line; `docker_get` returns them as a
+For `/events` it sets `until` to now when the caller gives none or a time in the
+future: Docker would otherwise keep the stream open until then. Docker sends one JSON object per line; `docker_get` returns them as a
 list, so that `select` applies. Docker keeps only the last EVENTS_KEPT events of
 a host in memory, on a busy host less than an hour. A second request reads that
 buffer, and a note in front of the result names its oldest event; if the
@@ -172,8 +172,11 @@ def _query(path: str, query_params: dict[str, str] | None, grep: bool = False) -
             params["tail"] = GREP_TAIL if grep else DEFAULT_TAIL
     if path.endswith("/stats"):
         params["stream"] = "false"
-    if path == "/events" and "until" not in params:
-        params["until"] = str(int(time.time()))
+    if path == "/events":
+        now = time.time()
+        until = _timestamp(params.get("until"), now)
+        if until is None or until > now:
+            params["until"] = str(int(now))
     return params
 
 
@@ -197,7 +200,7 @@ def register(mcp, client, *, read_only: bool) -> None:
             f"it searches the last {GREP_TAIL} lines unless tail or since is set and returns "
             "only the matching lines with their count. A log returns at most "
             f"{LOG_CHARS} characters, its newest lines. Stats: a single sample. Events: until "
-            f"defaults to now; Docker keeps only the last {EVENTS_KEPT} events of a host, the "
+            f"is at most now; Docker keeps only the last {EVENTS_KEPT} events of a host, the "
             "result starts with the time of the oldest one. Pass a JMESPath "
             "`select` to project JSON responses, e.g. for /containers/json with "
             "query_params {\"all\": \"true\", \"filters\": \"{\\\"name\\\": [\\\"web\\\"]}\"} "
