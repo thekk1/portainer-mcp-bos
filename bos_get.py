@@ -11,7 +11,11 @@ headers from multiplexed output. `grep` keeps only the log lines that match a
 regular expression; without tail or since it then searches the last
 GREP_TAIL lines. tail, since and until may also be passed as arguments of
 their own; since and until take Unix seconds, RFC 3339 or a duration back from
-now, and Docker gets Unix seconds. An empty log range names its period as UTC
+now, and Docker gets Unix seconds. Docker applies tail to the whole log before
+since and until, so a window with tail comes back empty unless it lies at the
+end; with since or until `docker_get` therefore leaves tail out of the request
+and keeps the last lines of the window itself. until without since searches
+the UNTIL_WINDOW seconds before until. An empty log range names its period as UTC
 dates, so that a wrongly computed timestamp shows. Values of command-line
 options and assignments whose name contains passw, secret, token, credential
 or api/private/encryption key, `unencrypted:` values, Bearer and Basic tokens
@@ -49,6 +53,7 @@ from portainer_mcp.shaping import DEFAULT_MAX_RESPONSE_CHARS, SELECT_DESCRIPTION
 
 DEFAULT_TAIL = "200"
 GREP_TAIL = "100000"
+UNTIL_WINDOW = 86400
 LOG_CHARS = 20_000
 # Room below the cap of the server for the note in front of the lines.
 NOTE_ROOM = 600
@@ -107,11 +112,16 @@ def _period(params: dict[str, str]) -> str | None:
     return f"period {since} to {until}"
 
 
-def _shape_logs(text: str, pattern: re.Pattern[str] | None, period: str | None = None) -> str:
-    """Filter log lines by `pattern`, redact secrets and keep the newest lines that fit the cap."""
+def _shape_logs(
+    text: str, pattern: re.Pattern[str] | None, period: str | None = None, tail: int | None = None
+) -> str:
+    """Keep the last `tail` lines, filter them by `pattern`, redact secrets and keep the newest
+    lines that fit the cap."""
     lines = [line.rstrip("\r") for line in text.split("\n")]
     if lines and lines[-1] == "":
         lines.pop()
+    if tail is not None:
+        lines = lines[-tail:] if tail > 0 else []
     notes = []
     total = len(lines)
     if pattern is not None:
@@ -223,6 +233,8 @@ def _query(path: str, query_params: dict[str, str] | None, grep: bool = False) -
             params["tail"] = params["tail"].strip("\"' ")
         if "stdout" not in params and "stderr" not in params:
             params["stdout"] = params["stderr"] = "true"
+        if "until" in params and "since" not in params:
+            params["since"] = str(int(params["until"]) - UNTIL_WINDOW)
         if "tail" not in params and "since" not in params:
             params["tail"] = GREP_TAIL if grep else DEFAULT_TAIL
     if path.endswith("/stats"):
@@ -251,8 +263,9 @@ def register(mcp, client, *, read_only: bool) -> None:
             "/images/json, /networks, /volumes. Logs: stdout and stderr and the last "
             f"{DEFAULT_TAIL} lines unless set (tail, since, until, as arguments or in "
             "`query_params`; since and until as RFC 3339 like 2026-01-31T14:30:00Z, Unix "
-            "seconds or a duration like 2h); the stream is never followed. An empty range "
-            "names its period. Secrets in log lines come back as [REDACTED]. To find problems "
+            "seconds or a duration like 2h; tail then counts from the end of that period, until "
+            f"alone searches the {UNTIL_WINDOW // 3600} hours before it); the stream is never "
+            "followed. An empty range names its period. Secrets in log lines come back as [REDACTED]. To find problems "
             "in a log, "
             "pass `grep` (e.g. ERROR|WARN|Exception|Caused by) instead of paging through it: "
             f"it searches the last {GREP_TAIL} lines unless tail or since is set and returns "
@@ -312,6 +325,10 @@ def register(mcp, client, *, read_only: bool) -> None:
             except re.error as exc:
                 raise ToolError(f"invalid grep expression {grep!r}: {exc}") from exc
         params = _query(path, query_params, grep=pattern is not None)
+        window_tail = None
+        if logs and "since" in params and "tail" in params:
+            value = params.pop("tail")
+            window_tail = int(value) if value.isdigit() else None
         response = await client.request(
             "GET", f"/endpoints/{environment_id}/docker{path}", params=params
         )
@@ -321,7 +338,7 @@ def register(mcp, client, *, read_only: bool) -> None:
                 f"GET {path}: {response.text[:2000]}"
             )
         if logs:
-            return _shape_logs(_demultiplex(response.content), pattern, _period(params))
+            return _shape_logs(_demultiplex(response.content), pattern, _period(params), window_tail)
         if path == "/events":
             return await _events(client, environment_id, response.text, query_params, select)
         if response.headers.get("content-type", "").startswith(_MULTIPLEXED):
