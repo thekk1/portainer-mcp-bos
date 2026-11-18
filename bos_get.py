@@ -32,6 +32,9 @@ list, so that `select` applies. Docker keeps only the last EVENTS_KEPT events of
 a host in memory, on a busy host less than an hour. A second request reads that
 buffer, and a note in front of the result names its oldest event; if the
 requested period starts earlier, the note says that older events are lost.
+
+An empty result of StackList gets a note in front: Portainer lists only the
+stacks the account may see, and an empty list was read as "no stacks".
 """
 
 from __future__ import annotations
@@ -45,7 +48,8 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastmcp.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from mcp.types import TextContent, ToolAnnotations
 from pydantic import BeforeValidator, Field
 
 from portainer_mcp import proxy, redaction, server
@@ -247,11 +251,32 @@ def _query(path: str, query_params: dict[str, str] | None, grep: bool = False) -
     return params
 
 
+STACKS_NOTE = (
+    "[StackList shows only the stacks this account may see; an empty list does not mean "
+    "that there are no stacks.]"
+)
+
+
+class EmptyStackListNote(Middleware):
+    """Put STACKS_NOTE in front of an empty StackList result."""
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next: CallNext):
+        result = await call_next(context)
+        if context.message.name != "StackList":
+            return result
+        texts = [getattr(item, "text", None) for item in result.content]
+        if all(isinstance(text, str) and text.strip() in ("", "[]", "null") for text in texts):
+            # structured_content stays: a client checks it against the output schema.
+            result.content = [TextContent(type="text", text=STACKS_NOTE + "\n[]")]
+        return result
+
+
 _register = proxy.register
 
 
 def register(mcp, client, *, read_only: bool) -> None:
     _register(mcp, client, read_only=read_only)
+    mcp.add_middleware(EmptyStackListNote())
 
     @mcp.tool(
         name="docker_get",
